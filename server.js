@@ -2,129 +2,104 @@ const net = require("net");
 const WebSocket = require("ws");
 
 // ========================================
-// 설정
+// 설정: 로봇 3대 IP (당일 시리얼 모니터에 뜬 IP로 교체)
 // ========================================
-
-// 나중에 규원님이 알려주는 ESP32 IP 주소를 여기에 입력
-const ESP32_IP = "192.168.219.189";
+const ROBOTS = [
+  { id: "01", ip: "192.168.0.101" },
+  { id: "02", ip: "192.168.0.102" },
+  { id: "03", ip: "192.168.0.103" },
+];
 const ESP32_PORT = 4000;
-
 const WS_PORT = 8080;
-
-const RECONNECT_DELAY = 3000; // 재연결 시도 간격 (3초)
+const RECONNECT_DELAY = 3000;
 
 // ========================================
-// 1. React ↔ Bridge WebSocket 서버
+// 1. React ↔ Bridge (WebSocket)
 // ========================================
-
 const wss = new WebSocket.Server({ port: WS_PORT });
+const sockets = {}; // robotId -> 연결된 로봇 소켓
 
-let esp32Socket = null;
+function broadcast(data) {
+  const message = JSON.stringify(data);
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) client.send(message);
+  });
+}
 
 wss.on("connection", (ws) => {
   console.log("React 앱이 연결되었습니다.");
-
-  ws.send(
-    JSON.stringify({
-      type: "bridge",
-      status: "connected",
-    })
-  );
+  ws.send(JSON.stringify({ type: "bridge", status: "connected" }));
 
   ws.on("message", (message) => {
-    const command = message.toString();
+    const text = message.toString();
+    let robotId = null;
+    let command = text;
 
-    console.log("React → Bridge:", command);
+    // {"robotId":"01","command":"forward"} 형태면 해당 로봇에만, 아니면 전체에 전달
+    try {
+      const obj = JSON.parse(text);
+      robotId = obj.robotId;
+      command = obj.command;
+    } catch (e) {}
 
-    // ESP32가 연결되어 있으면 명령 전달
-    if (esp32Socket && !esp32Socket.destroyed) {
-      esp32Socket.write(command + "\n");
-      console.log("Bridge → ESP32:", command);
-    } else {
-      console.log("ESP32가 아직 연결되지 않았습니다.");
-    }
+    const targets = robotId ? [sockets[robotId]] : Object.values(sockets);
+    targets.forEach((s) => {
+      if (s && !s.destroyed) {
+        s.write(command + "\n");
+        console.log(`Bridge → ESP32(${robotId || "ALL"}):`, command);
+      }
+    });
   });
 
-  ws.on("close", () => {
-    console.log("React 연결이 종료되었습니다.");
-  });
+  ws.on("close", () => console.log("React 연결이 종료되었습니다."));
 });
 
 console.log(`WebSocket 서버 실행 중: 포트 ${WS_PORT}`);
 
 // ========================================
-// 2. Bridge → ESP32 TCP 연결
+// 2. Bridge → 로봇 (TCP), 로봇마다 하나씩
 // ========================================
-
-function connectToESP32() {
-  console.log(`ESP32 연결 시도: ${ESP32_IP}:${ESP32_PORT}`);
-
+function connectRobot(robot) {
   const socket = new net.Socket();
+  let buffer = "";
+  let wasConnected = false;
 
-  socket.connect(ESP32_PORT, ESP32_IP, () => {
-    console.log("ESP32에 연결되었습니다!");
-    esp32Socket = socket;
+  console.log(`[${robot.id}] 연결 시도: ${robot.ip}:${ESP32_PORT}`);
 
-    broadcast({
-      type: "esp32",
-      status: "connected",
-    });
+  socket.connect(ESP32_PORT, robot.ip, () => {
+    console.log(`[${robot.id}] 연결되었습니다!`);
+    sockets[robot.id] = socket;
+    wasConnected = true;
+    broadcast({ type: "esp32", robotId: robot.id, status: "connected" });
   });
 
   socket.on("data", (data) => {
-    const message = data.toString().trim();
+    buffer += data.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop(); // 아직 덜 온 마지막 줄은 보관
 
-    console.log("ESP32 → Bridge:", message);
-
-    // ESP32에서 받은 데이터를 React에 전달
-    broadcast({
-      type: "robot",
-      data: message,
+    lines.forEach((line) => {
+      const msg = line.trim();
+      if (!msg) return;
+      console.log(`[${robot.id}] →`, msg);
+      broadcast({ type: "robot", data: msg });
     });
-  });
-
-  socket.on("close", () => {
-    console.log("ESP32 연결이 종료되었습니다.");
-
-    if (esp32Socket === socket) {
-      esp32Socket = null;
-    }
-
-    broadcast({
-      type: "esp32",
-      status: "disconnected",
-    });
-
-    // 재연결 시도
-    console.log(`${RECONNECT_DELAY / 1000}초 후 재연결을 시도합니다...`);
-    setTimeout(connectToESP32, RECONNECT_DELAY);
   });
 
   socket.on("error", (err) => {
-    console.log("ESP32 연결 오류:", err.message);
+    console.log(`[${robot.id}] 오류: ${err.message}`);
+  });
 
-    if (esp32Socket === socket) {
-      esp32Socket = null;
+  socket.on("close", () => {
+    if (sockets[robot.id] === socket) delete sockets[robot.id];
+
+    // 실제로 연결돼 있다가 끊긴 경우에만 앱에 알림 (재시도 실패는 조용히)
+    if (wasConnected) {
+      console.log(`[${robot.id}] 연결이 종료되었습니다.`);
+      broadcast({ type: "esp32", robotId: robot.id, status: "disconnected" });
     }
+    setTimeout(() => connectRobot(robot), RECONNECT_DELAY);
   });
 }
 
-// ========================================
-// 3. React 전체에 데이터 전달
-// ========================================
-
-function broadcast(data) {
-  const message = JSON.stringify(data);
-
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
-    }
-  });
-}
-
-// ========================================
-// 4. ESP32 연결 시작
-// ========================================
-
-connectToESP32();
+ROBOTS.forEach(connectRobot);
